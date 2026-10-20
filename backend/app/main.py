@@ -22,11 +22,14 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://deep-thought-call-buddy.vercel.app",
+        "https://deep-thought-call-buddy-r2wb1wzze-kotha-sri-javali-s-projects.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
 
 app.include_router(prospects_router, prefix="/prospects", tags=["prospects"])
 app.include_router(calls_router, prefix="/calls", tags=["calls"])
