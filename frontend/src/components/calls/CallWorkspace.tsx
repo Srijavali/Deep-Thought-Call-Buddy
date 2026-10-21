@@ -4,6 +4,37 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { API_URL } from "@/lib/api";
 
+type SpeechRecognitionAlternativeLike = {
+  transcript: string;
+};
+
+type SpeechRecognitionResultLike = {
+  isFinal: boolean;
+  [index: number]: SpeechRecognitionAlternativeLike;
+};
+
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: ArrayLike<SpeechRecognitionResultLike>;
+};
+
+type SpeechRecognitionLike = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: new () => SpeechRecognitionLike;
+  webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+};
+
 type StageStatus =
   | "complete"
   | "incomplete"
@@ -241,6 +272,16 @@ export default function CallWorkspace({
   const [historySummary, setHistorySummary] = useState<{ summary: string; call_count: number; key_points: string[]; recommended_next_steps: string[] } | null>(null);
   const [loadingLiveSuggestion, setLoadingLiveSuggestion] = useState(false);
   const [liveSuggestion, setLiveSuggestion] = useState<{ suggestion: string; reason: string } | null>(null);
+  const [liveTranscriptPreview, setLiveTranscriptPreview] = useState("");
+  const [liveTranscriptionStatus, setLiveTranscriptionStatus] = useState("Not started");
+
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const finalTranscriptRef = useRef("");
+  const latestTranscriptRef = useRef("");
+  const suggestionTimerRef = useRef<number | null>(null);
+  const recognitionRestartTimerRef = useRef<number | null>(null);
+  const suggestionRequestRef = useRef(0);
+  const manuallyStoppedRecognitionRef = useRef(false);
 
   const isReadOnly = false;
 
@@ -481,12 +522,182 @@ export default function CallWorkspace({
     return null;
   }
 
+  function clearLiveTimers() {
+    if (suggestionTimerRef.current !== null) {
+      window.clearTimeout(suggestionTimerRef.current);
+      suggestionTimerRef.current = null;
+    }
+    if (recognitionRestartTimerRef.current !== null) {
+      window.clearTimeout(recognitionRestartTimerRef.current);
+      recognitionRestartTimerRef.current = null;
+    }
+  }
+
+  function stopLiveSpeechRecognition() {
+    manuallyStoppedRecognitionRef.current = true;
+    clearLiveTimers();
+
+    const recognition = speechRecognitionRef.current;
+    speechRecognitionRef.current = null;
+
+    if (recognition) {
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      try {
+        recognition.stop();
+      } catch {
+        // Recognition may already have stopped.
+      }
+    }
+
+    setLiveTranscriptPreview("");
+  }
+
+  function scheduleLiveSuggestion(fullTranscript: string) {
+    if (callMode !== "guided_live" || !fullTranscript.trim() || !purpose.trim()) {
+      return;
+    }
+
+    if (suggestionTimerRef.current !== null) {
+      window.clearTimeout(suggestionTimerRef.current);
+    }
+
+    // Debounce speech so the API is not called for every short phrase.
+    suggestionTimerRef.current = window.setTimeout(() => {
+      suggestionTimerRef.current = null;
+      if (mediaRecorderRef.current?.state !== "recording") return;
+      void getLiveSuggestion(fullTranscript);
+    }, 1800);
+  }
+
+  function startLiveSpeechRecognition() {
+    const speechWindow = window as SpeechRecognitionWindow;
+    const Recognition =
+      speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+
+    if (!Recognition) {
+      setLiveTranscriptionStatus(
+        "Live transcription is not supported in this browser. You can still record and submit the audio for transcription."
+      );
+      return;
+    }
+
+    manuallyStoppedRecognitionRef.current = false;
+
+    const createRecognition = (): SpeechRecognitionLike => {
+      const recognition = new Recognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = "en-IN";
+
+      recognition.onresult = (event) => {
+        let newFinalText = "";
+        let interimText = "";
+
+        // Only consume newly changed results. Previously finalized results
+        // are already stored in finalTranscriptRef across recognition restarts.
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const result = event.results[i];
+          const phrase = result[0]?.transcript?.trim();
+          if (!phrase) continue;
+          if (result.isFinal) newFinalText += `${phrase} `;
+          else interimText += `${phrase} `;
+        }
+
+        if (newFinalText.trim()) {
+          finalTranscriptRef.current = [
+            finalTranscriptRef.current.trim(),
+            newFinalText.trim(),
+          ].filter(Boolean).join(" ").slice(-20000);
+        }
+
+        const combined = [
+          finalTranscriptRef.current.trim(),
+          interimText.trim(),
+        ].filter(Boolean).join(" ").slice(-20000);
+
+        latestTranscriptRef.current = combined;
+        setTranscript(combined);
+        setLiveTranscriptPreview(interimText.trim());
+        setLiveTranscriptionStatus("Listening for speech...");
+
+        if (newFinalText.trim()) {
+          scheduleLiveSuggestion(finalTranscriptRef.current);
+        }
+      };
+
+      recognition.onerror = (event) => {
+        // A temporary no-speech event is common during pauses. The onend
+        // handler below restarts recognition while the audio recorder runs.
+        if (event.error === "no-speech" || event.error === "aborted") return;
+
+        setLiveTranscriptionStatus(`Transcription issue: ${event.error}`);
+
+        // Do not restart endlessly when permission or the speech service fails.
+        if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported", "network"].includes(event.error)) {
+          manuallyStoppedRecognitionRef.current = true;
+          if (recognitionRestartTimerRef.current !== null) {
+            window.clearTimeout(recognitionRestartTimerRef.current);
+            recognitionRestartTimerRef.current = null;
+          }
+        }
+      };
+
+      recognition.onend = () => {
+        if (
+          manuallyStoppedRecognitionRef.current ||
+          mediaRecorderRef.current?.state !== "recording"
+        ) {
+          return;
+        }
+
+        setLiveTranscriptionStatus("Reconnecting speech recognition...");
+        recognitionRestartTimerRef.current = window.setTimeout(() => {
+          recognitionRestartTimerRef.current = null;
+          if (
+            manuallyStoppedRecognitionRef.current ||
+            mediaRecorderRef.current?.state !== "recording"
+          ) return;
+
+          try {
+            const nextRecognition = createRecognition();
+            speechRecognitionRef.current = nextRecognition;
+            nextRecognition.start();
+          } catch {
+            setLiveTranscriptionStatus(
+              "Could not restart live transcription. Recording continues; submit the audio to transcribe it later."
+            );
+          }
+        }, 300);
+      };
+
+      return recognition;
+    };
+
+    finalTranscriptRef.current = "";
+    latestTranscriptRef.current = "";
+    setLiveTranscriptPreview("");
+    setLiveTranscriptionStatus("Starting live transcription...");
+
+    try {
+      const recognition = createRecognition();
+      speechRecognitionRef.current = recognition;
+      recognition.start();
+    } catch {
+      setLiveTranscriptionStatus(
+        "Unable to start live transcription. Recording continues; submit the audio to transcribe it later."
+      );
+    }
+  }
+
   function releaseMicrophone() {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
   }
 
   function discardRecording() {
+    stopLiveSpeechRecognition();
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.onstop = null;
       try {
@@ -544,6 +755,7 @@ export default function CallWorkspace({
         if (event.data.size > 0) recordingChunksRef.current.push(event.data);
       };
       recorder.onerror = () => {
+        stopLiveSpeechRecognition();
         setError("The browser encountered an error while recording. Please try again.");
         releaseMicrophone();
         setIsRecording(false);
@@ -589,7 +801,12 @@ export default function CallWorkspace({
       setRecordingSeconds(0);
       setIsRecording(true);
       setRecordingStarting(false);
-      setNotice("Recording started. Stop when you have finished.");
+      setLiveSuggestion(null);
+      setTranscript("");
+      finalTranscriptRef.current = "";
+      latestTranscriptRef.current = "";
+      setNotice("Recording started. Live transcription is starting.");
+      startLiveSpeechRecognition();
     } catch (err) {
       releaseMicrophone();
       setRecordingStarting(false);
@@ -605,6 +822,7 @@ export default function CallWorkspace({
   }
 
   function stopRecording() {
+    stopLiveSpeechRecognition();
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       recorder.stop();
@@ -625,6 +843,16 @@ export default function CallWorkspace({
 
   useEffect(() => {
     return () => {
+      clearLiveTimers();
+      manuallyStoppedRecognitionRef.current = true;
+      const recognition = speechRecognitionRef.current;
+      speechRecognitionRef.current = null;
+      if (recognition) {
+        recognition.onresult = null;
+        recognition.onerror = null;
+        recognition.onend = null;
+        try { recognition.abort(); } catch { /* Already stopped. */ }
+      }
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state !== "inactive") {
         try {
@@ -844,8 +1072,10 @@ export default function CallWorkspace({
     setExpanded(aiAnalysis.stage_number);
   }
 
-  async function getLiveSuggestion() {
-    if (!transcript.trim()) {
+  async function getLiveSuggestion(transcriptOverride?: string) {
+    const currentTranscript = transcriptOverride ?? transcript;
+
+    if (!currentTranscript.trim()) {
       setError("Add the conversation transcript before requesting live guidance.");
       setNotice("");
       return;
@@ -855,41 +1085,67 @@ export default function CallWorkspace({
       setNotice("");
       return;
     }
+
+    const requestId = ++suggestionRequestRef.current;
     setLoadingLiveSuggestion(true);
     setError("");
     setNotice("");
-    setLiveSuggestion(null);
+
     try {
-      let prospectContext: unknown = null;
+      let prospectContext = "";
       const historyResponse = await fetch(
         `${API_URL}/prospects/${encodeURIComponent(prospectId)}/intelligence`,
-        { method: "GET", headers: { Accept: "application/json" }, credentials: "include" }
+        {
+          method: "GET",
+          headers: { Accept: "application/json" },
+          credentials: "include",
+        }
       );
-      if (historyResponse.ok) prospectContext = await historyResponse.json();
+
+      if (historyResponse.ok) {
+        const historyData = await historyResponse.json();
+        const rawContext = historyData?.context ?? historyData;
+        prospectContext = (
+          typeof rawContext === "string" ? rawContext : JSON.stringify(rawContext)
+        ).slice(0, 10000);
+      }
 
       const response = await fetch(`${API_URL}/ai/live-suggestion`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         credentials: "include",
         body: JSON.stringify({
-          transcript: transcript.trim(),
+          transcript: currentTranscript.trim().slice(-20000),
           purpose: purpose.trim(),
           current_stage: expanded ?? 1,
           prospect_context: prospectContext,
         }),
       });
+
       const data = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(typeof data?.detail === "string" ? data.detail : `Live suggestion failed (${response.status}).`);
+        throw new Error(
+          typeof data?.detail === "string"
+            ? data.detail
+            : `Live suggestion failed (${response.status}).`
+        );
       }
+
+      // Ignore older responses if a newer transcript has already triggered a request.
+      if (requestId !== suggestionRequestRef.current) return;
+
       setLiveSuggestion({
         suggestion: typeof data?.suggestion === "string" ? data.suggestion : "",
         reason: typeof data?.reason === "string" ? data.reason : "",
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to get a live suggestion.");
+      if (requestId === suggestionRequestRef.current) {
+        setError(err instanceof Error ? err.message : "Unable to get a live suggestion.");
+      }
     } finally {
-      setLoadingLiveSuggestion(false);
+      if (requestId === suggestionRequestRef.current) {
+        setLoadingLiveSuggestion(false);
+      }
     }
   }
 
@@ -1183,7 +1439,11 @@ export default function CallWorkspace({
             id="call-transcript"
             rows={6}
             value={transcript}
-            onChange={(event) => setTranscript(event.target.value)}
+            onChange={(event) => {
+              setTranscript(event.target.value);
+              latestTranscriptRef.current = event.target.value;
+              finalTranscriptRef.current = event.target.value;
+            }}
             placeholder="Paste the conversation transcript here..."
             disabled={analyzing || loadingStages}
             className="w-full rounded-lg border border-gray-200 px-3 py-2.5 text-sm outline-none focus:border-[#526a9d] focus:ring-2 focus:ring-[#526a9d]/10 disabled:bg-gray-50"
@@ -1198,12 +1458,25 @@ export default function CallWorkspace({
             <div>
               <h3 className="font-semibold text-gray-900">Live next-step guidance</h3>
               <p className="mt-1 text-sm text-gray-600">
-                Uses the transcript so far, call purpose, current stage, and saved prospect history when available. This is on-demand guidance; it does not automatically listen to or transcribe your call.
+                During browser recording, speech is transcribed when supported and the assistant refreshes suggestions after you pause. You can also request guidance manually from the transcript. Browser speech recognition availability and accuracy vary.
               </p>
+              {isRecording && (
+                <div className="rounded-lg border border-blue-200 bg-white p-3">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                    Live transcription status
+                  </p>
+                  <p className="mt-1 text-sm text-gray-800">{liveTranscriptionStatus}</p>
+                  {liveTranscriptPreview && (
+                    <p className="mt-2 text-sm italic text-gray-600">
+                      Hearing: {liveTranscriptPreview}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
             <button
               type="button"
-              onClick={() => void getLiveSuggestion()}
+              onClick={() => void getLiveSuggestion(latestTranscriptRef.current || transcript)}
               disabled={loadingLiveSuggestion || loadingStages || !transcript.trim()}
               className="rounded-lg bg-[#243b70] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#192c58] disabled:cursor-not-allowed disabled:opacity-50"
             >
