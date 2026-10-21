@@ -82,6 +82,8 @@ export default function Home() {
   const startCallSuggestionTimerRef = useRef<number | null>(null);
   const startCallSuggestionRequestRef = useRef(0);
   const [startCallLiveTranscript, setStartCallLiveTranscript] = useState("");
+  const [startCallSpeaker, setStartCallSpeaker] = useState<"CALLER" | "PROSPECT">("CALLER");
+  const startCallLastSuggestionTranscriptRef = useRef("");
   const [startCallInterimTranscript, setStartCallInterimTranscript] = useState("");
   const [startCallLiveSuggestion, setStartCallLiveSuggestion] = useState<{ suggestion: string; reason: string } | null>(null);
   const [startCallSuggestionLoading, setStartCallSuggestionLoading] = useState(false);
@@ -110,8 +112,11 @@ export default function Home() {
     const selectedPurpose = purposes.find((item) => item.id === startCallForm.purpose_id);
     const purposeText = selectedPurpose?.description?.trim() || selectedPurpose?.name || startCallForm.one_time_purpose.trim();
     if (!transcript.trim() || !purposeText) return;
+    if (transcript.trim() === startCallLastSuggestionTranscriptRef.current) return;
+    startCallLastSuggestionTranscriptRef.current = transcript.trim();
     const requestId = ++startCallSuggestionRequestRef.current;
     setStartCallSuggestionLoading(true);
+    setStartCallLiveStatus("Updating suggestion from the conversation so far…");
     setStartCallLiveError("");
     try {
       let prospectContext = selectedProspect
@@ -139,7 +144,7 @@ export default function Home() {
       setStartCallLiveSuggestion({ suggestion: typeof data?.suggestion === "string" ? data.suggestion : "", reason: typeof data?.reason === "string" ? data.reason : "" });
       setStartCallLiveStatus("Suggestion updated from the latest speech.");
     } catch (err) {
-      if (requestId === startCallSuggestionRequestRef.current) setStartCallLiveError(err instanceof Error ? err.message : "Unable to get a live suggestion.");
+      if (requestId === startCallSuggestionRequestRef.current) { startCallLastSuggestionTranscriptRef.current = ""; setStartCallLiveError(err instanceof Error ? err.message : "Unable to get a live suggestion."); setStartCallLiveStatus("Suggestion request failed. Keep speaking; the coach will retry when new speech arrives."); }
     } finally {
       if (requestId === startCallSuggestionRequestRef.current) setStartCallSuggestionLoading(false);
     }
@@ -153,6 +158,8 @@ export default function Home() {
       return;
     }
     startCallFinalTranscriptRef.current = "";
+    startCallLastSuggestionTranscriptRef.current = "";
+    setStartCallSpeaker("CALLER");
     setStartCallLiveTranscript("");
     setStartCallLiveSuggestion(null);
     setStartCallLiveError("");
@@ -166,13 +173,13 @@ export default function Home() {
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const phrase = event.results[i][0]?.transcript || "";
-        if (event.results[i].isFinal) startCallFinalTranscriptRef.current += `${phrase} `;
+        if (event.results[i].isFinal && phrase.trim()) startCallFinalTranscriptRef.current += `${startCallSpeaker}: ${phrase.trim()}\n`;
         else interim += phrase;
       }
       const fullTranscript = startCallFinalTranscriptRef.current.trim();
       setStartCallLiveTranscript(fullTranscript);
       setStartCallInterimTranscript(interim.trim());
-      if (fullTranscript.length > 8) {
+      if (fullTranscript.length > 8 && fullTranscript !== startCallLastSuggestionTranscriptRef.current) {
         if (startCallSuggestionTimerRef.current !== null) window.clearTimeout(startCallSuggestionTimerRef.current);
         startCallSuggestionTimerRef.current = window.setTimeout(() => {
           startCallSuggestionTimerRef.current = null;
@@ -205,6 +212,16 @@ export default function Home() {
     const interval = window.setInterval(() => setStartCallRecordingSeconds((seconds) => seconds + 1), 1000);
     return () => window.clearInterval(interval);
   }, [startCallRecording]);
+  useEffect(() => {
+    if (!startCallRecording) return;
+    const interval = window.setInterval(() => {
+      const transcript = startCallFinalTranscriptRef.current.trim();
+      if (transcript.length > 8 && transcript !== startCallLastSuggestionTranscriptRef.current && !startCallSuggestionLoading) {
+        void requestStartCallLiveSuggestion(transcript);
+      }
+    }, 7000);
+    return () => window.clearInterval(interval);
+  }, [startCallRecording, startCallSuggestionLoading, startCallForm, prospects, purposes]);
   const [startCallError, setStartCallError] = useState("");
   const [previousCallsError, setPreviousCallsError] = useState("");
   const [previousCallsRefreshKey, setPreviousCallsRefreshKey] = useState(0);
@@ -1950,10 +1967,23 @@ async function deletePurpose(purpose: Purpose) {
                   </div>
                   <div className="space-y-2 p-3">
                     <p className="text-xs text-gray-500">{startCallLiveStatus}</p>
+                    <div className="rounded-md border border-gray-200 bg-gray-50 p-2.5">
+                      <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-gray-600">Label the speaker</p>
+                      <div className="flex flex-wrap gap-2">
+                        <button type="button" onClick={() => setStartCallSpeaker("CALLER")} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "CALLER" ? "bg-indigo-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>You · Caller</button>
+                        <button type="button" onClick={() => setStartCallSpeaker("PROSPECT")} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "PROSPECT" ? "bg-emerald-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>Prospect</button>
+                      </div>
+                      <p className="mt-1.5 text-[11px] leading-4 text-gray-500">Choose who is speaking before they talk. Browser speech recognition cannot reliably identify speakers automatically.</p>
+                    </div>
                     {(startCallLiveTranscript || startCallInterimTranscript) ? (
-                      <div className="rounded-md bg-gray-50 p-2.5">
-                        <p className="mb-1 text-[11px] font-bold uppercase tracking-wide text-gray-500">Hearing</p>
-                        <p className="text-sm leading-5 text-gray-700">{startCallLiveTranscript} <span className="italic text-gray-400">{startCallInterimTranscript}</span></p>
+                      <div className="max-h-40 space-y-1 overflow-y-auto rounded-md bg-white p-1" aria-live="polite">
+                        <p className="mb-1 px-1 text-[11px] font-bold uppercase tracking-wide text-gray-500">Live conversation</p>
+                        {startCallLiveTranscript.split("\n").filter(Boolean).map((line, index) => {
+                          const isCaller = line.startsWith("CALLER:");
+                          const text = line.replace(/^(CALLER|PROSPECT):\s*/, "");
+                          return <div key={`${index}-${line.slice(0, 20)}`} className={`rounded-lg p-2 text-sm leading-5 ${isCaller ? "ml-4 bg-indigo-50 text-indigo-950" : "mr-4 bg-emerald-50 text-emerald-950"}`}><p className="mb-0.5 text-[10px] font-bold uppercase tracking-wide opacity-70">{isCaller ? "You · Caller" : "Prospect"}</p>{text}</div>;
+                        })}
+                        {startCallInterimTranscript && <div className={`rounded-lg p-2 text-sm italic leading-5 ${startCallSpeaker === "CALLER" ? "ml-4 bg-indigo-50/70 text-indigo-900" : "mr-4 bg-emerald-50/70 text-emerald-900"}`}><p className="mb-0.5 text-[10px] font-bold uppercase tracking-wide opacity-70">{startCallSpeaker === "CALLER" ? "You · Caller (speaking)" : "Prospect (speaking)"}</p>{startCallInterimTranscript}</div>}
                       </div>
                     ) : (
                       <p className="text-sm text-gray-500">Your next-sentence suggestion will appear here after you begin speaking.</p>
