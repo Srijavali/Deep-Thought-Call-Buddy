@@ -76,6 +76,130 @@ export default function Home() {
   const startCallMediaRecorderRef = useRef<MediaRecorder | null>(null);
   const startCallMediaStreamRef = useRef<MediaStream | null>(null);
   const startCallRecordingChunksRef = useRef<Blob[]>([]);
+  const startCallSpeechRecognitionRef = useRef<any>(null);
+  const startCallRecordingActiveRef = useRef(false);
+  const startCallFinalTranscriptRef = useRef("");
+  const startCallSuggestionTimerRef = useRef<number | null>(null);
+  const startCallSuggestionRequestRef = useRef(0);
+  const [startCallLiveTranscript, setStartCallLiveTranscript] = useState("");
+  const [startCallInterimTranscript, setStartCallInterimTranscript] = useState("");
+  const [startCallLiveSuggestion, setStartCallLiveSuggestion] = useState<{ suggestion: string; reason: string } | null>(null);
+  const [startCallSuggestionLoading, setStartCallSuggestionLoading] = useState(false);
+  const [startCallLiveStatus, setStartCallLiveStatus] = useState("Start recording to get live coaching.");
+  const [startCallLiveError, setStartCallLiveError] = useState("");
+
+  function stopStartCallSpeechRecognition() {
+    if (startCallSuggestionTimerRef.current !== null) {
+      window.clearTimeout(startCallSuggestionTimerRef.current);
+      startCallSuggestionTimerRef.current = null;
+    }
+    startCallRecordingActiveRef.current = false;
+    const recognition = startCallSpeechRecognitionRef.current;
+    startCallSpeechRecognitionRef.current = null;
+    if (recognition) {
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      try { recognition.stop(); } catch { /* already stopped */ }
+    }
+    setStartCallInterimTranscript("");
+  }
+
+  async function requestStartCallLiveSuggestion(transcript: string) {
+    const selectedProspect = prospects.find((item) => item.id === startCallForm.prospect_id);
+    const selectedPurpose = purposes.find((item) => item.id === startCallForm.purpose_id);
+    const purposeText = selectedPurpose?.description?.trim() || selectedPurpose?.name || startCallForm.one_time_purpose.trim();
+    if (!transcript.trim() || !purposeText) return;
+    const requestId = ++startCallSuggestionRequestRef.current;
+    setStartCallSuggestionLoading(true);
+    setStartCallLiveError("");
+    try {
+      let prospectContext = selectedProspect
+        ? `Prospect name: ${selectedProspect.full_name || "Not provided"}. Company: ${selectedProspect.company_name || "Not provided"}. Notes: ${selectedProspect.notes || "Not provided"}.`
+        : "Prospect context not available.";
+      if (selectedProspect?.id) {
+        try {
+          const historyResponse = await fetch(`${API_URL}/prospects/${encodeURIComponent(selectedProspect.id)}/intelligence`, { headers: { Accept: "application/json" }, credentials: "include" });
+          if (historyResponse.ok) {
+            const historyData = await historyResponse.json();
+            const rawContext = historyData?.context ?? historyData;
+            prospectContext += "\nSaved prospect intelligence: " + (typeof rawContext === "string" ? rawContext : JSON.stringify(rawContext)).slice(0, 7000);
+          }
+        } catch { /* basic prospect details are still useful */ }
+      }
+      const response = await fetch(`${API_URL}/ai/live-suggestion`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ transcript: transcript.trim().slice(-20000), purpose: purposeText, current_stage: 1, prospect_context: prospectContext.slice(0, 10000) }),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(typeof data?.detail === "string" ? data.detail : `Live suggestion failed (${response.status}).`);
+      if (requestId !== startCallSuggestionRequestRef.current) return;
+      setStartCallLiveSuggestion({ suggestion: typeof data?.suggestion === "string" ? data.suggestion : "", reason: typeof data?.reason === "string" ? data.reason : "" });
+      setStartCallLiveStatus("Suggestion updated from the latest speech.");
+    } catch (err) {
+      if (requestId === startCallSuggestionRequestRef.current) setStartCallLiveError(err instanceof Error ? err.message : "Unable to get a live suggestion.");
+    } finally {
+      if (requestId === startCallSuggestionRequestRef.current) setStartCallSuggestionLoading(false);
+    }
+  }
+
+  function startStartCallSpeechRecognition() {
+    const speechWindow = window as any;
+    const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setStartCallLiveStatus("Live speech-to-text is not supported in this browser. Try the latest Chrome or Edge.");
+      return;
+    }
+    startCallFinalTranscriptRef.current = "";
+    setStartCallLiveTranscript("");
+    setStartCallLiveSuggestion(null);
+    setStartCallLiveError("");
+    const recognition = new Recognition();
+    startCallSpeechRecognitionRef.current = recognition;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-IN";
+    recognition.onstart = () => setStartCallLiveStatus("Listening for speech…");
+    recognition.onresult = (event: any) => {
+      let interim = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const phrase = event.results[i][0]?.transcript || "";
+        if (event.results[i].isFinal) startCallFinalTranscriptRef.current += `${phrase} `;
+        else interim += phrase;
+      }
+      const fullTranscript = startCallFinalTranscriptRef.current.trim();
+      setStartCallLiveTranscript(fullTranscript);
+      setStartCallInterimTranscript(interim.trim());
+      if (fullTranscript.length > 8) {
+        if (startCallSuggestionTimerRef.current !== null) window.clearTimeout(startCallSuggestionTimerRef.current);
+        startCallSuggestionTimerRef.current = window.setTimeout(() => {
+          startCallSuggestionTimerRef.current = null;
+          if (startCallRecordingActiveRef.current) void requestStartCallLiveSuggestion(fullTranscript);
+        }, 1800);
+      }
+    };
+    recognition.onerror = (event: any) => {
+      setStartCallLiveStatus(`Speech recognition issue: ${event.error || "unknown error"}.`);
+      if (["not-allowed", "service-not-allowed", "audio-capture", "language-not-supported"].includes(event.error)) stopStartCallSpeechRecognition();
+    };
+    recognition.onend = () => {
+      if (startCallRecordingActiveRef.current && startCallSpeechRecognitionRef.current === recognition) {
+        window.setTimeout(() => {
+          if (startCallRecordingActiveRef.current && startCallSpeechRecognitionRef.current === recognition) {
+            try { recognition.start(); } catch { /* browser may still be restarting */ }
+          }
+        }, 400);
+      }
+    };
+    try { recognition.start(); } catch { setStartCallLiveStatus("Could not start speech recognition. Please try again."); }
+  }
+
+  useEffect(() => {
+    if (!startCallOpen) stopStartCallSpeechRecognition();
+    return () => stopStartCallSpeechRecognition();
+  }, [startCallOpen]);
   useEffect(() => {
     if (!startCallRecording) return;
     const interval = window.setInterval(() => setStartCallRecordingSeconds((seconds) => seconds + 1), 1000);
@@ -1459,7 +1583,7 @@ async function deletePurpose(purpose: Purpose) {
 
         <button
           type="button"
-          onClick={() => { if (startCallMediaRecorderRef.current?.state === "recording") startCallMediaRecorderRef.current.stop(); startCallMediaStreamRef.current?.getTracks().forEach((track) => track.stop()); setStartCallRecording(false); setStartCallOpen(false); }}
+          onClick={() => { startCallRecordingActiveRef.current = false; stopStartCallSpeechRecognition(); if (startCallMediaRecorderRef.current?.state === "recording") startCallMediaRecorderRef.current.stop(); startCallMediaStreamRef.current?.getTracks().forEach((track) => track.stop()); setStartCallRecording(false); setStartCallOpen(false); }}
           className="text-gray-500 hover:text-gray-800"
         >
           Cancel
@@ -1795,11 +1919,15 @@ async function deletePurpose(purpose: Purpose) {
                           stream.getTracks().forEach((track) => track.stop());
                           startCallMediaStreamRef.current = null;
                           setStartCallRecording(false);
+                          startCallRecordingActiveRef.current = false;
+                          stopStartCallSpeechRecognition();
                         };
                         startCallMediaRecorderRef.current = recorder;
                         recorder.start(1000);
                         setStartCallRecording(true);
+                        startCallRecordingActiveRef.current = true;
                         setStartCallRecordingSeconds(0);
+                        startStartCallSpeechRecognition();
                       } catch (err) {
                         setStartCallError(err instanceof Error ? err.message : "Unable to access the microphone.");
                         startCallMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1811,6 +1939,36 @@ async function deletePurpose(purpose: Purpose) {
                     <button type="button" onClick={() => startCallMediaRecorderRef.current?.state !== "inactive" && startCallMediaRecorderRef.current?.stop()} className="rounded-md bg-red-600 px-3 py-2 text-sm font-semibold text-white">■ Stop recording</button>
                   )}
                   {startCallRecording && <span className="text-sm font-semibold tabular-nums text-red-700">● REC {Math.floor(startCallRecordingSeconds / 60).toString().padStart(2, "0")}:{(startCallRecordingSeconds % 60).toString().padStart(2, "0")}</span>}
+                </div>
+                <div className="rounded-lg border border-indigo-200 bg-white shadow-sm" aria-live="polite">
+                  <div className="flex items-center justify-between gap-2 rounded-t-lg border-b border-indigo-100 bg-indigo-50 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <span aria-hidden="true" className="text-lg">✦</span>
+                      <p className="text-sm font-bold text-indigo-950">Live Call Coach</p>
+                    </div>
+                    <span className={`text-xs font-semibold ${startCallRecording ? "text-red-700" : "text-gray-500"}`}>{startCallRecording ? "LIVE" : "READY"}</span>
+                  </div>
+                  <div className="space-y-2 p-3">
+                    <p className="text-xs text-gray-500">{startCallLiveStatus}</p>
+                    {(startCallLiveTranscript || startCallInterimTranscript) ? (
+                      <div className="rounded-md bg-gray-50 p-2.5">
+                        <p className="mb-1 text-[11px] font-bold uppercase tracking-wide text-gray-500">Hearing</p>
+                        <p className="text-sm leading-5 text-gray-700">{startCallLiveTranscript} <span className="italic text-gray-400">{startCallInterimTranscript}</span></p>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500">Your next-sentence suggestion will appear here after you begin speaking.</p>
+                    )}
+                    {startCallSuggestionLoading && <p className="text-sm font-medium text-indigo-700">Thinking of a helpful next response…</p>}
+                    {startCallLiveSuggestion && (
+                      <div className="rounded-md border border-indigo-100 bg-indigo-50/60 p-3">
+                        <p className="mb-1 text-[11px] font-bold uppercase tracking-wide text-indigo-700">Try saying</p>
+                        <p className="text-base font-semibold leading-6 text-gray-900">{startCallLiveSuggestion.suggestion || "Keep listening and continue the conversation naturally."}</p>
+                        {startCallLiveSuggestion.reason && <p className="mt-2 text-xs leading-5 text-gray-600"><strong>Why:</strong> {startCallLiveSuggestion.reason}</p>}
+                      </div>
+                    )}
+                    {startCallLiveError && <p className="rounded-md bg-red-50 p-2 text-xs leading-5 text-red-700">{startCallLiveError}</p>}
+                    {!startCallForm.purpose_id && !startCallForm.one_time_purpose.trim() && <p className="text-xs text-amber-700">Choose a saved purpose or enter a one-time purpose to enable suggestions.</p>}
+                  </div>
                 </div>
                 {startCallAudioFile && startCallForm.input_method === "browser_recording" && (
                   <div className="space-y-2 rounded-md border border-blue-100 bg-white p-3">
@@ -1827,7 +1985,7 @@ async function deletePurpose(purpose: Purpose) {
         <div className="flex justify-end gap-3">
           <button
             type="button"
-            onClick={() => { if (startCallMediaRecorderRef.current?.state === "recording") startCallMediaRecorderRef.current.stop(); startCallMediaStreamRef.current?.getTracks().forEach((track) => track.stop()); setStartCallRecording(false); setStartCallOpen(false); }}
+            onClick={() => { startCallRecordingActiveRef.current = false; stopStartCallSpeechRecognition(); if (startCallMediaRecorderRef.current?.state === "recording") startCallMediaRecorderRef.current.stop(); startCallMediaStreamRef.current?.getTracks().forEach((track) => track.stop()); setStartCallRecording(false); setStartCallOpen(false); }}
             className="rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-700"
           >
             Cancel
