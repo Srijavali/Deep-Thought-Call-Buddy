@@ -2073,7 +2073,10 @@ export default function CallWorkspace({
   const [historyAnalyzing, setHistoryAnalyzing] = useState(false);
   const [historySummary, setHistorySummary] = useState<{ summary: string; call_count: number; key_points: string[]; recommended_next_steps: string[] } | null>(null);
   const [loadingLiveSuggestion, setLoadingLiveSuggestion] = useState(false);
-  const [liveSuggestion, setLiveSuggestion] = useState<{ suggestion: string; reason: string } | null>(null);
+  const [liveSuggestion, setLiveSuggestion] = useState<{ suggestion: string; reason: string; inferred_speaker?: string; latest_prospect_statement?: string; target_question?: string } | null>(null);
+  const [speakerHint, setSpeakerHint] = useState<"auto" | "caller" | "prospect">("auto");
+  const [latestUtterance, setLatestUtterance] = useState("");
+  const [prospectContext, setProspectContext] = useState("");
   const [liveTranscriptPreview, setLiveTranscriptPreview] = useState("");
   const [liveTranscriptionStatus, setLiveTranscriptionStatus] = useState("Not started");
 
@@ -2086,6 +2089,29 @@ export default function CallWorkspace({
   const manuallyStoppedRecognitionRef = useRef(false);
 
   const isReadOnly = false;
+
+  // Load prospect intelligence once per prospect, not on every live suggestion.
+  useEffect(() => {
+    let cancelled = false;
+    async function loadProspectContext() {
+      setProspectContext("");
+      try {
+        const response = await fetch(
+          `${API_URL}/prospects/${encodeURIComponent(prospectId)}/intelligence`,
+          { method: "GET", headers: { Accept: "application/json" }, credentials: "include" }
+        );
+        if (!response.ok) return;
+        const data = await response.json();
+        const raw = data?.context ?? data;
+        const value = typeof raw === "string" ? raw : JSON.stringify(raw);
+        if (!cancelled) setProspectContext((value || "").slice(0, 5000));
+      } catch {
+        // Live guidance still works with the current transcript and purpose.
+      }
+    }
+    if (prospectId) void loadProspectContext();
+    return () => { cancelled = true; };
+  }, [prospectId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2356,7 +2382,7 @@ export default function CallWorkspace({
     setLiveTranscriptPreview("");
   }
 
-  function scheduleLiveSuggestion(fullTranscript: string) {
+  function scheduleLiveSuggestion(fullTranscript: string, latestTurn = "") {
     if (callMode !== "guided_live" || !fullTranscript.trim() || !purpose.trim()) {
       return;
     }
@@ -2369,7 +2395,7 @@ export default function CallWorkspace({
     suggestionTimerRef.current = window.setTimeout(() => {
       suggestionTimerRef.current = null;
       if (mediaRecorderRef.current?.state !== "recording") return;
-      void getLiveSuggestion(fullTranscript);
+      void getLiveSuggestion(fullTranscript, latestTurn);
     }, 1800);
   }
 
@@ -2425,7 +2451,8 @@ export default function CallWorkspace({
         setLiveTranscriptionStatus("Listening for speech...");
 
         if (newFinalText.trim()) {
-          scheduleLiveSuggestion(finalTranscriptRef.current);
+          setLatestUtterance(newFinalText.trim());
+          scheduleLiveSuggestion(finalTranscriptRef.current, newFinalText.trim());
         }
       };
 
@@ -2890,10 +2917,10 @@ export default function CallWorkspace({
     setExpanded(aiAnalysis.stage_number);
   }
 
-  async function getLiveSuggestion(transcriptOverride?: string) {
-    const currentTranscript = transcriptOverride ?? transcript;
-
-    if (!currentTranscript.trim()) {
+  async function getLiveSuggestion(transcriptOverride?: string, latestTurnOverride?: string) {
+    const currentTranscript = (transcriptOverride ?? latestTranscriptRef.current ?? transcript).trim();
+    const currentLatestTurn = (latestTurnOverride ?? latestUtterance).trim();
+    if (!currentTranscript) {
       setError("Add the conversation transcript before requesting live guidance.");
       setNotice("");
       return;
@@ -2908,62 +2935,38 @@ export default function CallWorkspace({
     setLoadingLiveSuggestion(true);
     setError("");
     setNotice("");
-
     try {
-      let prospectContext = "";
-      const historyResponse = await fetch(
-        `${API_URL}/prospects/${encodeURIComponent(prospectId)}/intelligence`,
-        {
-          method: "GET",
-          headers: { Accept: "application/json" },
-          credentials: "include",
-        }
-      );
-
-      if (historyResponse.ok) {
-        const historyData = await historyResponse.json();
-        const rawContext = historyData?.context ?? historyData;
-        prospectContext = (
-          typeof rawContext === "string" ? rawContext : JSON.stringify(rawContext)
-        ).slice(0, 10000);
-      }
-
       const response = await fetch(`${API_URL}/ai/live-suggestion`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         credentials: "include",
         body: JSON.stringify({
-          transcript: currentTranscript.trim().slice(-20000),
+          transcript: currentTranscript.slice(-12000),
+          latest_utterance: currentLatestTurn.slice(-1200),
+          speaker_hint: speakerHint,
           purpose: purpose.trim(),
           current_stage: expanded ?? 1,
-          prospect_context: prospectContext,
+          prospect_context: prospectContext.slice(0, 5000),
         }),
       });
-
       const data = await response.json().catch(() => null);
       if (!response.ok) {
-        throw new Error(
-          typeof data?.detail === "string"
-            ? data.detail
-            : `Live suggestion failed (${response.status}).`
-        );
+        throw new Error(typeof data?.detail === "string" ? data.detail : `Live suggestion failed (${response.status}).`);
       }
-
-      // Ignore older responses if a newer transcript has already triggered a request.
       if (requestId !== suggestionRequestRef.current) return;
-
       setLiveSuggestion({
         suggestion: typeof data?.suggestion === "string" ? data.suggestion : "",
         reason: typeof data?.reason === "string" ? data.reason : "",
+        inferred_speaker: typeof data?.inferred_speaker === "string" ? data.inferred_speaker : undefined,
+        latest_prospect_statement: typeof data?.latest_prospect_statement === "string" ? data.latest_prospect_statement : undefined,
+        target_question: typeof data?.target_question === "string" ? data.target_question : undefined,
       });
     } catch (err) {
       if (requestId === suggestionRequestRef.current) {
         setError(err instanceof Error ? err.message : "Unable to get a live suggestion.");
       }
     } finally {
-      if (requestId === suggestionRequestRef.current) {
-        setLoadingLiveSuggestion(false);
-      }
+      if (requestId === suggestionRequestRef.current) setLoadingLiveSuggestion(false);
     }
   }
 
@@ -3261,6 +3264,8 @@ export default function CallWorkspace({
               setTranscript(event.target.value);
               latestTranscriptRef.current = event.target.value;
               finalTranscriptRef.current = event.target.value;
+              const lines = event.target.value.trim().split(/\n+/).filter(Boolean);
+              setLatestUtterance(lines[lines.length - 1] || "");
             }}
             placeholder="Paste the conversation transcript here..."
             disabled={analyzing || loadingStages}
@@ -3292,9 +3297,18 @@ export default function CallWorkspace({
                 </div>
               )}
             </div>
+            <div className="rounded-lg border border-blue-100 bg-white p-3">
+              <label htmlFor="speaker-hint" className="block text-sm font-medium text-gray-700">Who said the latest line?</label>
+              <select id="speaker-hint" value={speakerHint} onChange={(event) => setSpeakerHint(event.target.value as "auto" | "caller" | "prospect")} className="mt-1 w-full rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-800">
+                <option value="auto">Auto-detect from conversation (recommended)</option>
+                <option value="caller">Caller — I am speaking as the caller</option>
+                <option value="prospect">Prospect — I am speaking as the prospect</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500">When testing both sides with the same voice, choose the role for your latest line. The system cannot reliably identify the role from voice alone.</p>
+            </div>
             <button
               type="button"
-              onClick={() => void getLiveSuggestion(latestTranscriptRef.current || transcript)}
+              onClick={() => void getLiveSuggestion(latestTranscriptRef.current || transcript, latestUtterance)}
               disabled={loadingLiveSuggestion || loadingStages || !transcript.trim()}
               className="rounded-lg bg-[#243b70] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#192c58] disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -3304,7 +3318,10 @@ export default function CallWorkspace({
               <div aria-live="polite" className="space-y-2 rounded-lg border border-blue-200 bg-white p-4">
                 <h4 className="font-semibold text-gray-900">Suggested next sentence</h4>
                 <p className="whitespace-pre-wrap text-sm leading-6 text-gray-800">{liveSuggestion.suggestion || "No suggestion was returned. Add more transcript context and try again."}</p>
+                {liveSuggestion.inferred_speaker && <p className="text-xs font-medium uppercase tracking-wide text-[#526a9d]">Latest line identified as: {liveSuggestion.inferred_speaker}</p>}
+                {liveSuggestion.latest_prospect_statement && <p className="text-sm text-gray-700"><strong>Prospect statement:</strong> {liveSuggestion.latest_prospect_statement}</p>}
                 {liveSuggestion.reason && <p className="text-sm text-gray-600"><strong>Why:</strong> {liveSuggestion.reason}</p>}
+                {liveSuggestion.target_question && <p className="text-sm text-gray-700"><strong>What this helps uncover:</strong> {liveSuggestion.target_question}</p>}
                 <p className="border-t border-gray-100 pt-2 text-xs text-gray-500">This suggestion does not change outcomes, save notes, or mark any stage complete.</p>
               </div>
             )}
