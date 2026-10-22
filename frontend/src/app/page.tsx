@@ -2170,7 +2170,9 @@ export default function Home() {
     const selectedProspect = prospects.find((item) => item.id === startCallForm.prospect_id);
     const selectedPurpose = purposes.find((item) => item.id === startCallForm.purpose_id);
     const purposeText = selectedPurpose?.description?.trim() || selectedPurpose?.name || startCallForm.one_time_purpose.trim();
-    if (!transcript.trim() && !latestUtterance.trim()) return;
+    // Live coaching must be grounded in a finalized utterance, not just
+    // an accumulated transcript or an interim browser-recognition fragment.
+    if (!latestUtterance.trim()) return;
     if (transcript.trim() === startCallLastSuggestionTranscriptRef.current) return;
     startCallLastSuggestionTranscriptRef.current = transcript.trim();
     const requestId = ++startCallSuggestionRequestRef.current;
@@ -2264,7 +2266,15 @@ export default function Home() {
         startCallSuggestionTimerRef.current = window.setTimeout(() => {
           startCallSuggestionTimerRef.current = null;
           if (startCallRecordingActiveRef.current) {
-            void requestStartCallLiveSuggestion(fullTranscript, latestUtterance, latestSpeaker);
+            // Use refs here: the browser may emit interim-only results after
+            // the latest finalized utterance, leaving local latestUtterance empty.
+            const utteranceForSuggestion = startCallLatestUtteranceRef.current;
+            const speakerForSuggestion = startCallLatestSpeakerRef.current;
+            void requestStartCallLiveSuggestion(
+              fullTranscript,
+              utteranceForSuggestion,
+              speakerForSuggestion,
+            );
           }
         }, 1800);
       }
@@ -2299,8 +2309,14 @@ export default function Home() {
     const interval = window.setInterval(() => {
       const transcript = startCallFinalTranscriptRef.current.trim();
       const latestUtterance = startCallLatestUtteranceRef.current;
-      if (transcript.length > 8 && transcript !== startCallLastSuggestionTranscriptRef.current && !startCallSuggestionLoading) {
-        void requestStartCallLiveSuggestion(transcript, latestUtterance, startCallLatestSpeakerRef.current);
+      const latestSpeaker = startCallLatestSpeakerRef.current;
+      if (
+        transcript.length > 8 &&
+        latestUtterance.trim() &&
+        transcript !== startCallLastSuggestionTranscriptRef.current &&
+        !startCallSuggestionLoading
+      ) {
+        void requestStartCallLiveSuggestion(transcript, latestUtterance, latestSpeaker);
       }
     }, 7000);
     return () => window.clearInterval(interval);
