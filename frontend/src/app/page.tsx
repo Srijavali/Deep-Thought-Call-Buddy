@@ -2134,6 +2134,10 @@ export default function Home() {
   const startCallSuggestionRequestRef = useRef(0);
   const [startCallLiveTranscript, setStartCallLiveTranscript] = useState("");
   const [startCallSpeaker, setStartCallSpeaker] = useState<"CALLER" | "PROSPECT">("CALLER");
+  // Refs keep speaker selection and latest speech current inside async browser callbacks.
+  const startCallSpeakerRef = useRef<"CALLER" | "PROSPECT">("CALLER");
+  const startCallLatestUtteranceRef = useRef("");
+  const startCallLatestSpeakerRef = useRef<"CALLER" | "PROSPECT">("CALLER");
   const startCallLastSuggestionTranscriptRef = useRef("");
   const [startCallInterimTranscript, setStartCallInterimTranscript] = useState("");
   const [startCallLiveSuggestion, setStartCallLiveSuggestion] = useState<{ suggestion: string; reason: string } | null>(null);
@@ -2158,11 +2162,15 @@ export default function Home() {
     setStartCallInterimTranscript("");
   }
 
-  async function requestStartCallLiveSuggestion(transcript: string) {
+  async function requestStartCallLiveSuggestion(
+    transcript: string,
+    latestUtterance = startCallLatestUtteranceRef.current,
+    speakerHint: "CALLER" | "PROSPECT" = startCallLatestSpeakerRef.current,
+  ) {
     const selectedProspect = prospects.find((item) => item.id === startCallForm.prospect_id);
     const selectedPurpose = purposes.find((item) => item.id === startCallForm.purpose_id);
     const purposeText = selectedPurpose?.description?.trim() || selectedPurpose?.name || startCallForm.one_time_purpose.trim();
-    if (!transcript.trim() || !purposeText) return;
+    if (!transcript.trim() && !latestUtterance.trim()) return;
     if (transcript.trim() === startCallLastSuggestionTranscriptRef.current) return;
     startCallLastSuggestionTranscriptRef.current = transcript.trim();
     const requestId = ++startCallSuggestionRequestRef.current;
@@ -2187,7 +2195,14 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         credentials: "include",
-        body: JSON.stringify({ transcript: transcript.trim().slice(-20000), purpose: purposeText, current_stage: 1, prospect_context: prospectContext.slice(0, 10000) }),
+        body: JSON.stringify({
+          transcript: transcript.trim().slice(-20000),
+          latest_utterance: latestUtterance.trim(),
+          speaker_hint: speakerHint.toLowerCase(),
+          purpose: purposeText,
+          current_stage: 1,
+          prospect_context: prospectContext.slice(0, 10000),
+        }),
       });
       const data = await response.json().catch(() => null);
       if (!response.ok) throw new Error(typeof data?.detail === "string" ? data.detail : `Live suggestion failed (${response.status}).`);
@@ -2210,6 +2225,9 @@ export default function Home() {
     }
     startCallFinalTranscriptRef.current = "";
     startCallLastSuggestionTranscriptRef.current = "";
+    startCallSpeakerRef.current = "CALLER";
+    startCallLatestUtteranceRef.current = "";
+    startCallLatestSpeakerRef.current = "CALLER";
     setStartCallSpeaker("CALLER");
     setStartCallLiveTranscript("");
     setStartCallLiveSuggestion(null);
@@ -2222,10 +2240,21 @@ export default function Home() {
     recognition.onstart = () => setStartCallLiveStatus("Listening for speech…");
     recognition.onresult = (event: any) => {
       let interim = "";
+      let latestUtterance = "";
+      let latestSpeaker: "CALLER" | "PROSPECT" = startCallSpeakerRef.current;
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const phrase = event.results[i][0]?.transcript || "";
-        if (event.results[i].isFinal && phrase.trim()) startCallFinalTranscriptRef.current += `${startCallSpeaker}: ${phrase.trim()}\n`;
-        else interim += phrase;
+        if (event.results[i].isFinal && phrase.trim()) {
+          // Attach the currently selected speaker to this finalized speech result.
+          const speaker = startCallSpeakerRef.current;
+          latestUtterance = phrase.trim();
+          latestSpeaker = speaker;
+          startCallLatestUtteranceRef.current = latestUtterance;
+          startCallLatestSpeakerRef.current = latestSpeaker;
+          startCallFinalTranscriptRef.current += `${speaker}: ${latestUtterance}\n`;
+        } else {
+          interim += phrase;
+        }
       }
       const fullTranscript = startCallFinalTranscriptRef.current.trim();
       setStartCallLiveTranscript(fullTranscript);
@@ -2234,7 +2263,9 @@ export default function Home() {
         if (startCallSuggestionTimerRef.current !== null) window.clearTimeout(startCallSuggestionTimerRef.current);
         startCallSuggestionTimerRef.current = window.setTimeout(() => {
           startCallSuggestionTimerRef.current = null;
-          if (startCallRecordingActiveRef.current) void requestStartCallLiveSuggestion(fullTranscript);
+          if (startCallRecordingActiveRef.current) {
+            void requestStartCallLiveSuggestion(fullTranscript, latestUtterance, latestSpeaker);
+          }
         }, 1800);
       }
     };
@@ -2267,8 +2298,9 @@ export default function Home() {
     if (!startCallRecording) return;
     const interval = window.setInterval(() => {
       const transcript = startCallFinalTranscriptRef.current.trim();
+      const latestUtterance = startCallLatestUtteranceRef.current;
       if (transcript.length > 8 && transcript !== startCallLastSuggestionTranscriptRef.current && !startCallSuggestionLoading) {
-        void requestStartCallLiveSuggestion(transcript);
+        void requestStartCallLiveSuggestion(transcript, latestUtterance, startCallLatestSpeakerRef.current);
       }
     }, 7000);
     return () => window.clearInterval(interval);
@@ -4100,8 +4132,8 @@ async function deletePurpose(purpose: Purpose) {
                     <div className="rounded-md border border-gray-200 bg-gray-50 p-2.5">
                       <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-gray-600">Label the speaker</p>
                       <div className="flex flex-wrap gap-2">
-                        <button type="button" onClick={() => setStartCallSpeaker("CALLER")} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "CALLER" ? "bg-indigo-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>You · Caller</button>
-                        <button type="button" onClick={() => setStartCallSpeaker("PROSPECT")} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "PROSPECT" ? "bg-emerald-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>Prospect</button>
+                        <button type="button" onClick={() => { startCallSpeakerRef.current = "CALLER"; setStartCallSpeaker("CALLER"); }} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "CALLER" ? "bg-indigo-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>You · Caller</button>
+                        <button type="button" onClick={() => { startCallSpeakerRef.current = "PROSPECT"; setStartCallSpeaker("PROSPECT"); }} className={`rounded-full px-3 py-1.5 text-xs font-semibold ${startCallSpeaker === "PROSPECT" ? "bg-emerald-700 text-white" : "border border-gray-300 bg-white text-gray-700"}`}>Prospect</button>
                       </div>
                       <p className="mt-1.5 text-[11px] leading-4 text-gray-500">Choose who is speaking before they talk. Browser speech recognition cannot reliably identify speakers automatically.</p>
                     </div>
@@ -4127,7 +4159,7 @@ async function deletePurpose(purpose: Purpose) {
                       </div>
                     )}
                     {startCallLiveError && <p className="rounded-md bg-red-50 p-2 text-xs leading-5 text-red-700">{startCallLiveError}</p>}
-                    {!startCallForm.purpose_id && !startCallForm.one_time_purpose.trim() && <p className="text-xs text-amber-700">Choose a saved purpose or enter a one-time purpose to enable suggestions.</p>}
+                    {!startCallForm.purpose_id && !startCallForm.one_time_purpose.trim() && <p className="text-xs text-gray-500">Purpose is optional; live suggestions prioritize the latest speech and selected speaker.</p>}
                   </div>
                 </div>
                 {startCallAudioFile && startCallForm.input_method === "browser_recording" && (
