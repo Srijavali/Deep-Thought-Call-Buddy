@@ -449,8 +449,8 @@ def upload_audio_for_analysis(
 
 class LiveSuggestionRequest(BaseModel):
     transcript: str = Field(min_length=1, max_length=20000)
-    purpose: str = Field(default="", max_length=2000)
-    current_stage: int = Field(default=1, ge=1, le=8)
+    purpose: str = Field(min_length=1, max_length=2000)
+    current_stage: int = Field(ge=1, le=8)
     prospect_context: str = Field(default="", max_length=10000)
     latest_utterance: str = Field(default="", max_length=1200)
     speaker_hint: str = Field(default="auto", pattern="^(auto|caller|prospect)$")
@@ -470,27 +470,66 @@ def live_suggestion(request: LiveSuggestionRequest):
         1: "Opening", 2: "Purpose", 3: "Permission", 4: "Their business",
         5: "Their need in their words", 6: "Objection", 7: "Next step", 8: "Close",
     }
+
+    # Recover the latest turn from the transcript if the frontend omitted it.
+    latest_utterance = (request.latest_utterance or "").strip()
+    speaker_hint = (request.speaker_hint or "auto").strip().lower()
+    if not latest_utterance:
+        transcript_lines = [
+            line.strip() for line in request.transcript.splitlines() if line.strip()
+        ]
+        if transcript_lines:
+            last_line = transcript_lines[-1]
+            labelled_turn = re.match(
+                r"^(CALLER|YOU\s*[·:-]?\s*CALLER|PROSPECT)\s*:\s*(.+)$",
+                last_line,
+                re.IGNORECASE,
+            )
+            if labelled_turn:
+                role_text = labelled_turn.group(1).upper()
+                latest_utterance = labelled_turn.group(2).strip()
+                if speaker_hint == "auto":
+                    speaker_hint = "prospect" if role_text == "PROSPECT" else "caller"
+            else:
+                latest_utterance = last_line[-1200:]
+
     client = Groq(api_key=api_key)
 
     instructions = """
-You are a live conversation coach. Your response must be driven almost entirely by the LATEST UTTERANCE and the supplied SPEAKER HINT.
+You are a fast, discreet live cold-call copilot. Your first priority is to respond to
+what the prospect most recently said, not to mechanically advance the call stage.
 
-STRICT PRIORITY:
-1. Treat LATEST UTTERANCE as the primary and decisive input.
-2. Treat SPEAKER HINT as authoritative when it is CALLER or PROSPECT. Do not override a manual selection by guessing from the transcript.
-3. Use the recent transcript only to understand references in the latest sentence (for example, what 'the report' refers to). Do not let old conversation, call purpose, stage, or prospect history redirect the answer.
-4. Ignore call purpose, stage, and prospect history when they do not directly help interpret the latest utterance.
-5. If the latest speaker is PROSPECT, give the caller one natural, directly relevant response to what the prospect just said. Answer their question or address their concern before asking anything else. Do not jump to a close unless the latest utterance clearly indicates the conversation is ending.
-6. If the latest speaker is CALLER, do not answer as if the caller were the prospect. Give a brief cue to listen for the prospect, or a concise next action that follows directly from the caller's latest sentence.
-7. If the speaker hint is AUTO, infer the role from conversational context; if unclear, return UNKNOWN and avoid a confident assumption.
-8. Do not invent facts, product claims, commitments, or deadlines. Keep the suggestion short and speakable.
+ROLE IDENTIFICATION:
+- The transcript may be plain text and may contain no speaker labels.
+- Infer whether the latest utterance is from CALLER or PROSPECT using conversational
+  context: who is asking, answering, presenting the service, objecting, or responding.
+- The same human voice may play both roles during testing. Do not use voice identity;
+  use conversational meaning. If the role is genuinely unclear, return UNKNOWN.
+- If SPEAKER HINT is CALLER or PROSPECT, treat it as a user-provided correction for
+  the latest utterance. If AUTO, infer from context.
+- Never claim certainty when the transcript does not support it.
+
+SUGGESTION RULES:
+1. If the latest utterance is from the PROSPECT, address that exact question, answer,
+   concern, objection, or refusal first. Then, only if appropriate, give one targeted
+   follow-up question that discovers the most important missing information.
+2. Do not repeat questions already answered in the transcript or ask for facts already
+   present in prospect context. Prefer the single highest-value missing detail.
+3. If the latest utterance is from the CALLER, do not pretend it was the prospect.
+   Give a brief next step only when the conversation supports it; otherwise tell the
+   caller to listen for the prospect's response.
+4. If the prospect says no or asks not to be contacted, advise respecting that request.
+5. Do not invent company services, prospect facts, promises, or deadlines. Use company
+   facts only when present in the supplied context.
+6. Keep the suggested line natural and short enough to say during a live call.
+7. Use stage as background guidance only. Relevance to the latest prospect turn wins.
 
 Return valid JSON with exactly these fields:
 - suggestion: one short sentence the caller can say next
-- reason: one short sentence explaining how it follows from the latest utterance
+- reason: one short sentence tied to the latest turn
 - inferred_speaker: CALLER, PROSPECT, or UNKNOWN
-- latest_prospect_statement: the latest utterance only if its speaker is PROSPECT; otherwise empty
-- target_question: a relevant question only if the latest turn warrants one; otherwise empty
+- latest_prospect_statement: the latest prospect statement, or empty if none is supported
+- target_question: the key information the suggested question aims to uncover, or empty
 """
 
     try:
@@ -501,9 +540,13 @@ Return valid JSON with exactly these fields:
                 {
                     "role": "user",
                     "content": (
-                        f"SPEAKER HINT (manual selection takes precedence): {request.speaker_hint.upper()}\n\n"
-                        f"LATEST UTTERANCE (primary input; respond to this only):\n{request.latest_utterance or '[not supplied]'}\n\n"
-                        f"RECENT TRANSCRIPT (reference only, do not let it override the latest utterance):\n{request.transcript[-4000:]}"
+                        f"CALL PURPOSE:\n{request.purpose}\n\n"
+                        f"CURRENT STAGE (secondary context): {stage_names[request.current_stage]}\n\n"
+                        f"SPEAKER HINT: {speaker_hint.upper()}\n\n"
+                        f"LATEST UTTERANCE (prioritise this):\n{latest_utterance or '[no usable speech found]'}\n\n"
+                        f"RECENT CONVERSATION TRANSCRIPT:\n{request.transcript[-12000:]}\n\n"
+                        f"RELEVANT PROSPECT HISTORY / CONTEXT:\n{request.prospect_context[:5000] or '[not available]'}\n\n"
+                        "Identify the latest speaker, then give the most relevant next line for the caller."
                     ),
                 },
             ],
