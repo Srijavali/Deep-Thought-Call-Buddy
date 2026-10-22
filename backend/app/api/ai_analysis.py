@@ -1,6 +1,7 @@
 
 import os
 import json
+import re
 from supabase_client import supabase
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from groq import Groq
