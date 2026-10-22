@@ -11,6 +11,14 @@ from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/ai", tags=["AI Analysis"])
 
+# Keep the live path lightweight. GPT-OSS 20B is Groq's recommended faster
+# replacement for retired Llama 3.1 8B Instant on developer-tier accounts.
+# The more thorough full-call analysis continues to use the larger model.
+LIVE_SUGGESTION_MODEL = os.getenv("GROQ_LIVE_SUGGESTION_MODEL", "openai/gpt-oss-20b")
+STAGE_ANALYSIS_MODEL = os.getenv("GROQ_STAGE_ANALYSIS_MODEL", "openai/gpt-oss-20b")
+FULL_CALL_ANALYSIS_MODEL = os.getenv("GROQ_FULL_CALL_ANALYSIS_MODEL", "openai/gpt-oss-120b")
+PROSPECT_HISTORY_MODEL = os.getenv("GROQ_PROSPECT_HISTORY_MODEL", "openai/gpt-oss-20b")
+
 
 @router.get("/prospect-history/{prospect_id}")
 def analyze_prospect_history(prospect_id: str):
@@ -31,7 +39,7 @@ def analyze_prospect_history(prospect_id: str):
             }
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=PROSPECT_HISTORY_MODEL,
             messages=[
                 {"role": "system", "content": "You summarize saved prospect history for a salesperson. Use only the supplied records. Do not invent facts or claim that a call transcript exists when only metadata or stage notes exist. Distinguish confirmed facts from gaps. Return valid JSON with summary (string), key_points (array of strings), and recommended_next_steps (array of strings)."},
                 {"role": "user", "content": "Analyze this prospect's saved profile, call history, and stage results. Summarize the relationship so far and what the caller should do next.\n\nSAVED CONTEXT:\n" + context},
@@ -209,7 +217,7 @@ Return valid JSON with these fields:
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=STAGE_ANALYSIS_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -452,7 +460,7 @@ Return valid JSON with keys overall_summary, history_assessment, stages, follow_
     )
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=FULL_CALL_ANALYSIS_MODEL,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
             response_format={"type": "json_object"},
             temperature=0.1,
@@ -657,8 +665,9 @@ STAGE ASSESSMENT:
 - Use "incomplete" when the stage has not been achieved or has not yet been reached.
 - Use "needs_clarification" when evidence is ambiguous or conflicting.
 - Use "not_assessable" only when the transcript cannot reasonably support a judgment.
-- Include a short evidence quote or empty string; never invent quotes.
-- Include missing_information as a short array of concise gaps. If the objective is sufficiently covered, return an empty array.
+- Include a short evidence quote (maximum 160 characters) or empty string; never invent quotes.
+- Include at most two concise missing_information items per stage. If sufficiently covered, return an empty array.
+- Keep suggestion to one sentence, reason to one sentence, and next_stage_reason to one short sentence.
 - Stage progress is provisional and may change as more transcript arrives. Do not treat the assessment as a permanent saved stage result.
 
 BUSINESS ACCURACY:
@@ -679,7 +688,8 @@ Return valid JSON with:
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=LIVE_SUGGESTION_MODEL,
+            max_completion_tokens=1200,
             messages=[
                 {"role": "system", "content": instructions},
                 {
@@ -690,9 +700,12 @@ Return valid JSON with:
                         f"FRONTEND'S CURRENT STAGE: {stage_names[request.current_stage]} "
                         f"(stage {request.current_stage}). Treat this as context, not a requirement to force the conversation.\n\n"
                         f"EIGHT STAGE OBJECTIVES:\n{json.dumps(stage_objectives, ensure_ascii=False)}\n\n"
-                        f"PROSPECT HISTORY (background only):\n{request.prospect_context}\n\n"
-                        f"TRANSCRIPT SO FAR (current call; use as primary evidence):\n{request.transcript}\n\n"
-                        "First respond appropriately to the latest prospect statement. In parallel, assess all eight objectives and choose a missing objective to advance only if it fits naturally. Return only the requested JSON."
+                        # The live endpoint is called repeatedly, so keep its prompt bounded.
+                        # Preserve the most recent turns because the latest prospect statement
+                        # is the highest-priority signal for the next sentence.
+                        f"PROSPECT HISTORY (background only; truncated):\n{request.prospect_context[-2500:]}\n\n"
+                        f"TRANSCRIPT SO FAR (current call; latest 10000 characters):\n{request.transcript[-10000:]}\n\n"
+                        "First respond appropriately to the latest prospect statement. In parallel, assess all eight objectives and choose a missing objective to advance only if it fits naturally. Keep every field concise so the caller gets a fast response. Return only the requested JSON."
                     ),
                 },
             ],
