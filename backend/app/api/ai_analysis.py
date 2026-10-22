@@ -1,6 +1,8 @@
 
 import os
 import json
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from supabase_client import supabase
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from groq import Groq
@@ -271,6 +273,7 @@ class FullCallAnalysisRequest(BaseModel):
     transcript: str = Field(min_length=1, max_length=100000)
     source_type: str = Field(default="manual_notes", pattern="^(audio_upload|manual_notes|live_recording)$")
     source_filename: str | None = None
+    timezone: str = "Asia/Kolkata"
 
 
 def _verify_call_and_prospect(call_id: str, prospect_id: str) -> None:
@@ -312,6 +315,111 @@ def _save_transcript(request: FullCallAnalysisRequest) -> None:
         ) from error
 
 
+def _timezone_is_valid(timezone_name: str) -> bool:
+    try:
+        ZoneInfo(timezone_name)
+        return True
+    except Exception:
+        return False
+
+
+def _persist_full_call_follow_up_tasks(
+    tasks: list,
+    prospect_id: str,
+    call_id: str,
+    timezone_name: str,
+) -> list[dict]:
+    """Persist evidence-backed follow-up tasks from the same full-call AI pass."""
+    if not tasks:
+        return []
+
+    if not _timezone_is_valid(timezone_name):
+        timezone_name = "Asia/Kolkata"
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+
+    for item in tasks:
+        if not isinstance(item, dict):
+            continue
+
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+
+        due_at = item.get("due_at")
+        valid_due = False
+        if isinstance(due_at, str) and due_at.strip():
+            try:
+                parsed = datetime.fromisoformat(due_at.strip().replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    due_at = parsed.astimezone(timezone.utc).isoformat()
+                    valid_due = True
+                else:
+                    due_at = None
+            except (ValueError, TypeError):
+                due_at = None
+        else:
+            due_at = None
+
+        try:
+            confidence = float(item.get("confidence", 0.5))
+            confidence = max(0.0, min(1.0, confidence))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        rows.append({
+            "prospect_id": prospect_id,
+            "source_call_id": call_id,
+            "task_type": str(item.get("task_type") or "follow_up")[:50],
+            "title": title[:180],
+            "details": str(item.get("details") or "")[:1500],
+            "due_at": due_at if valid_due else None,
+            "timezone": timezone_name[:80],
+            "status": "pending",
+            "source_excerpt": str(item.get("source_excerpt") or "")[:1000],
+            "ai_confidence": confidence,
+            "needs_confirmation": bool(item.get("needs_confirmation", False)) or not valid_due,
+            "updated_at": now,
+        })
+
+    if not rows:
+        return []
+
+    try:
+        existing_result = (
+            supabase.table("follow_up_tasks")
+            .select("title, source_excerpt")
+            .eq("prospect_id", prospect_id)
+            .eq("source_call_id", call_id)
+            .in_("status", ["pending", "rescheduled"])
+            .execute()
+        )
+        existing_keys = {
+            (
+                str(row.get("title") or "").strip().casefold(),
+                str(row.get("source_excerpt") or "").strip().casefold(),
+            )
+            for row in (existing_result.data or [])
+        }
+        rows = [
+            row for row in rows
+            if (
+                row["title"].strip().casefold(),
+                row["source_excerpt"].strip().casefold(),
+            ) not in existing_keys
+        ]
+        if rows:
+            supabase.table("follow_up_tasks").insert(rows).execute()
+        return rows
+    except Exception as error:
+        print("FULL-CALL FOLLOW-UP PERSISTENCE ERROR:", repr(error))
+        raise HTTPException(
+            status_code=500,
+            detail="The call was analysed, but follow-up reminders could not be saved. Confirm the follow_up_tasks migration and backend Supabase permissions.",
+        ) from error
+
+
 def _run_full_call_analysis(request: FullCallAnalysisRequest) -> dict:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -330,12 +438,17 @@ Never invent quotes, commitments, dates, or facts. If there is no useful histori
 For each of the eight stages return exactly one object. status must be one of complete, incomplete, needs_clarification, not_assessable. Use complete only when there is clear evidence that the stage's meaningful objective was achieved. Use incomplete when it was not achieved or not reached, needs_clarification when evidence conflicts or is ambiguous, and not_assessable only when the transcript cannot reasonably support a judgment.
 Choose outcome_key only from the allowed outcomes supplied for that stage. If nothing fits, choose other_or_unclear when available. Never mark a stage complete merely because the call continued.
 prospect_words should contain a short exact quote from the transcript or an empty string. caller_notes should be factual and concise. evidence, missing_information are arrays of strings. uncertainty should be an empty string if there is no material uncertainty.
-Return valid JSON with keys overall_summary, history_assessment, stages. stages must contain all eight stages in order. Each stage object must have stage_number, status, outcome_key, prospect_words, caller_notes, evidence, missing_information, uncertainty.
+Extract follow_up_tasks in this same analysis pass. Only create a task when the transcript contains an explicit commitment or a clear action agreed to by the caller or prospect. Do not create generic tasks just because a call ended. Each task must contain title, details, task_type, due_at, due_text, source_excerpt, confidence, needs_confirmation. source_excerpt must be a short exact excerpt from the current transcript. due_at must be an ISO-8601 datetime with timezone only when the deadline is unambiguous and resolvable using the current local time and timezone supplied below; otherwise set due_at to null and needs_confirmation to true. Never invent a deadline. Include explicit promises such as sending a report, emailing information, or calling back.
+Return valid JSON with keys overall_summary, history_assessment, stages, follow_up_tasks. stages must contain all eight stages in order. Each stage object must have stage_number, status, outcome_key, prospect_words, caller_notes, evidence, missing_information, uncertainty. follow_up_tasks must be an array and may be empty.
 """
+    timezone_name = request.timezone if _timezone_is_valid(request.timezone) else "Asia/Kolkata"
+    current_local_time = datetime.now(ZoneInfo(timezone_name)).isoformat()
     user_content = (
-        "ALLOWED STAGES AND OUTCOMES:\n" + json.dumps(FULL_CALL_STAGES, ensure_ascii=False) +
-        "\n\nSAVED PROSPECT PROFILE AND CALL HISTORY (may be empty or incomplete):\n" + context +
-        "\n\nCURRENT CALL TRANSCRIPT:\n" + request.transcript
+        "ALLOWED STAGES AND OUTCOMES:\\n" + json.dumps(FULL_CALL_STAGES, ensure_ascii=False) +
+        "\\n\\nSAVED PROSPECT PROFILE AND CALL HISTORY (may be empty or incomplete):\\n" + context +
+        "\\n\\nCURRENT LOCAL TIME: " + current_local_time +
+        "\\nTIMEZONE: " + timezone_name +
+        "\\n\\nCURRENT CALL TRANSCRIPT:\\n" + request.transcript
     )
     try:
         response = client.chat.completions.create(
@@ -373,6 +486,15 @@ Return valid JSON with keys overall_summary, history_assessment, stages. stages 
                 "missing_information": stage.get("missing_information") if isinstance(stage.get("missing_information"), list) else [],
                 "uncertainty": str(stage.get("uncertainty") or ""),
             })
+        raw_tasks = result.get("follow_up_tasks")
+        if not isinstance(raw_tasks, list):
+            raw_tasks = []
+        saved_tasks = _persist_full_call_follow_up_tasks(
+            raw_tasks,
+            request.prospect_id,
+            request.call_id,
+            timezone_name,
+        )
         return {
             "call_id": request.call_id,
             "prospect_id": request.prospect_id,
@@ -380,6 +502,7 @@ Return valid JSON with keys overall_summary, history_assessment, stages. stages 
             "overall_summary": str(result.get("overall_summary") or ""),
             "history_assessment": str(result.get("history_assessment") or ""),
             "stages": normalized,
+            "follow_up_tasks": saved_tasks,
         }
     except HTTPException:
         raise
@@ -400,6 +523,7 @@ def upload_audio_for_analysis(
     prospect_id: str = Form(...),
     file: UploadFile = File(...),
     source_type: str = Form("audio_upload"),
+    timezone_name: str = Form("Asia/Kolkata"),
 ):
     """Transcribe an uploaded recording with Groq, persist it, and analyse all stages."""
     allowed_types = {
@@ -438,6 +562,7 @@ def upload_audio_for_analysis(
             transcript=transcript.strip(),
             source_type=source_type,
             source_filename=filename,
+            timezone=timezone_name,
         )
         return _run_full_call_analysis(request)
     except HTTPException:
